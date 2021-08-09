@@ -20,6 +20,7 @@ import (
 	"github.com/openebs/maya/pkg/alertlog"
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog"
@@ -30,6 +31,13 @@ import (
 	mconfig "github.com/openebs/maya/pkg/apis/openebs.io/v1alpha1"
 )
 
+const (
+	Type     = "type"
+	XfsQuota = "xfs-quota"
+	Bhard    = "bhard"
+	Bsoft    = "bsoft"
+)
+
 // ProvisionHostPath is invoked by the Provisioner which expect HostPath PV
 //  to be provisioned and a valid PV spec returned.
 func (p *Provisioner) ProvisionHostPath(opts pvController.ProvisionOptions, volumeConfig *VolumeConfig) (*v1.PersistentVolume, error) {
@@ -38,6 +46,10 @@ func (p *Provisioner) ProvisionHostPath(opts pvController.ProvisionOptions, volu
 	name := opts.PVName
 	stgType := volumeConfig.GetStorageType()
 	saName := getOpenEBSServiceAccountName()
+	//capacity := opts.PVC.Spec.Resources.Requests[v1.ResourceStorage]
+	scType := opts.StorageClass.Parameters[Type]
+	bsoft := opts.StorageClass.Parameters[Bsoft]
+	bhard := opts.StorageClass.Parameters[Bhard]
 
 	nodeAffinityKey := volumeConfig.GetNodeAffinityLabelKey()
 	if len(nodeAffinityKey) == 0 {
@@ -69,9 +81,13 @@ func (p *Provisioner) ProvisionHostPath(opts pvController.ProvisionOptions, volu
 		path:                   path,
 		nodeAffinityLabelKey:   nodeAffinityKey,
 		nodeAffinityLabelValue: nodeAffinityValue,
-		serviceAccountName:     saName,
-		selectedNodeTaints:     taints,
-		imagePullSecrets:       imagePullSecrets,
+		//capacity:               capacity.String(),
+		scType:             scType,
+		bsoft:              bsoft,
+		bhard:              bhard,
+		serviceAccountName: saName,
+		selectedNodeTaints: taints,
+		imagePullSecrets:   imagePullSecrets,
 	}
 	iErr := p.createInitPod(podOpts)
 	if iErr != nil {
@@ -84,6 +100,46 @@ func (p *Provisioner) ProvisionHostPath(opts pvController.ProvisionOptions, volu
 			"storagetype", stgType,
 		)
 		return nil, iErr
+	}
+
+	//
+	if scType == XfsQuota && (len(bsoft) != 0 || len(bhard) != 0) {
+		// Check when both limits are specified, they are valid limits
+		// Validation: bsoft shouldn't be greater than bhard
+		if len(bsoft) != 0 && len(bhard) != 0 {
+			err := ValidateLimits(bsoft, bhard)
+			if err != nil {
+				klog.Infof("Setting xfs quota for volume %v failed: %v", name, err)
+				alertlog.Logger.Errorw("",
+					"eventcode", "local.pv.quota.failure",
+					"msg", "Failed to set xfs quota limits for Local PV",
+					"rname", opts.PVName,
+					"reason", "xfs quota validation failed",
+					"storagetype", stgType,
+				)
+				return nil, err
+			}
+		}
+
+		xfsQuotaErr := p.createXfsQuotaComponents(podOpts)
+		if xfsQuotaErr != nil {
+			klog.Infof("Setting xfs quota for volume %v failed: %v", name, xfsQuotaErr)
+			alertlog.Logger.Errorw("",
+				"eventcode", "local.pv.quota.failure",
+				"msg", "Failed to set xfs quota limits for Local PV",
+				"rname", opts.PVName,
+				"reason", "Setting xfs quota failed",
+				"storagetype", stgType,
+			)
+			return nil, xfsQuotaErr
+		}
+
+		alertlog.Logger.Infow("",
+			"eventcode", "local.pv.quota.success",
+			"msg", "Successfully applied xfs quota limits to the Local PV volume",
+			"rname", opts.PVName,
+			"storagetype", stgType,
+		)
 	}
 
 	// VolumeMode will always be specified as Filesystem for host path volume,
@@ -133,6 +189,24 @@ func (p *Provisioner) ProvisionHostPath(opts pvController.ProvisionOptions, volu
 		"storagetype", stgType,
 	)
 	return pvObj, nil
+}
+
+//
+func ValidateLimits(bsoft, bhard string) error {
+	//var bsoftLimit, bhardLimit resource.Quantity
+	bsoftLimit, err := resource.ParseQuantity(bsoft)
+	if err != nil {
+		return err
+	}
+	bhardLimit, err := resource.ParseQuantity(bhard)
+	if err != nil {
+		return err
+	}
+	if bsoftLimit.Cmp(bhardLimit) > 0 {
+		error := errors.New("bsoft limit is greater than bhard limit")
+		return error
+	}
+	return nil
 }
 
 // GetNodeObjectFromLabels returns the Node Object with matching label key and value

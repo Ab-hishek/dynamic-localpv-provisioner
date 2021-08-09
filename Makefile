@@ -163,8 +163,10 @@ provisioner-localpv-image: provisioner-localpv
 	@echo "--> provisioner-localpv image "
 	@echo "-------------------------------"
 	@cp bin/provisioner-localpv/${PROVISIONER_LOCALPV} buildscripts/provisioner-localpv/
+	@cp -R cmd/provisioner-localpv/scripts buildscripts/provisioner-localpv/
 	@cd buildscripts/provisioner-localpv && docker build -t ${PROVISIONER_LOCALPV_IMAGE_TAG} ${DBUILD_ARGS} . --no-cache
 	@rm buildscripts/provisioner-localpv/${PROVISIONER_LOCALPV}
+	@rm -rf buildscripts/provisioner-localpv/scripts
 
 .PHONY: license-check
 license-check:

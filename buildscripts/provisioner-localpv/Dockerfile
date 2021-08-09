@@ -25,6 +25,7 @@ RUN apk add --no-cache \
     ca-certificates
 
 COPY provisioner-localpv /
+COPY scripts /
 
 ARG ARCH
 ARG DBUILD_DATE

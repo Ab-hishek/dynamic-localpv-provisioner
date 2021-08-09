@@ -187,6 +187,38 @@ func (c *VolumeConfig) GetStorageType() string {
 	return stgType
 }
 
+/*
+// getXfsQuota returns the xfsQuota enables value
+// configured in StorageClass. Default is "false"
+func (c *VolumeConfig) GetXfsQuota() string {
+	xfsQuota := c.getEnabledFieldValue(KeyXfsQuota)
+	if len(strings.TrimSpace(xfsQuota)) == 0 {
+		return "false"
+	}
+	return xfsQuota
+}
+
+// getBsoftValue returns the bsoft limit value
+// configured in StorageClass. Default is ""
+func (c *VolumeConfig) GetBsoftValue() string {
+	bsoft := c.getValue(KeyBsoftLimit)
+	if len(strings.TrimSpace(bsoft)) == 0 {
+		return ""
+	}
+	return bsoft
+}
+
+// getBhardValue returns the bhard limit value
+// configured in StorageClass. Default is ""
+func (c *VolumeConfig) GetBhardValue() string {
+	bhard := c.getValue(KeyBhardLimit)
+	if len(strings.TrimSpace(bhard)) == 0 {
+		return ""
+	}
+	return bhard
+}
+*/
+
 //GetFSType returns the FSType value configured
 // in StorageClass. Default is "", auto-determined
 // by Local PV
@@ -282,6 +314,29 @@ func (c *VolumeConfig) getValue(key string) string {
 	}
 	return ""
 }
+
+/*
+//getEnabledFieldValue is a utility function to extract the enabled field
+// of the `key` from the ConfigMap object - which is
+// map[string]interface{map[string][string]}
+// Example:
+// {
+//     key1: {
+//             value: value1
+//             enabled: true
+//           }
+// }
+// In the above example, if `key1` is passed as input,
+// `enabled` will be returned.
+func (c *VolumeConfig) getEnabledFieldValue(key string) string {
+	if configObj, ok := util.GetNestedField(c.options, key).(map[string]string); ok {
+		if val, p := configObj[string(mconfig.EnabledPTP)]; p {
+			return val
+		}
+	}
+	return ""
+}
+*/
 
 // GetStorageClassName extracts the StorageClass name from PVC
 func GetStorageClassName(pvc *v1.PersistentVolumeClaim) *string {

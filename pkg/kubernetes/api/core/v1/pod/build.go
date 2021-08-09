@@ -64,6 +64,27 @@ func (b *Builder) WithTolerationsForTaints(taints ...corev1.Taint) *Builder {
 	return b
 }
 
+// WithSecurityContext sets securitycontext of the pod
+func (b *Builder) WithSecurityContext(runAsUser *int64) *Builder {
+	if runAsUser == nil {
+		b.errs = append(
+			b.errs,
+			errors.New(
+				"failed to build container object: missing securitycontext",
+			),
+		)
+		return b
+	}
+
+	newUserUUID := *runAsUser
+	newsecuritycontext := &corev1.PodSecurityContext{
+		RunAsUser: &newUserUUID,
+	}
+
+	b.pod.object.Spec.SecurityContext = newsecuritycontext
+	return b
+}
+
 // WithName sets the Name field of Pod with provided value.
 func (b *Builder) WithName(name string) *Builder {
 	if len(name) == 0 {

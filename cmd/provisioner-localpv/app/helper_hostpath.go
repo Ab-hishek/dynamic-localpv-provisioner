@@ -20,7 +20,9 @@ and modified to work with the configuration options used by OpenEBS
 package app
 
 import (
+	"io/ioutil"
 	"path/filepath"
+	"strings"
 	"time"
 
 	errors "github.com/pkg/errors"
@@ -28,11 +30,13 @@ import (
 
 	hostpath "github.com/openebs/maya/pkg/hostpath/v1alpha1"
 
+	corev1 "k8s.io/api/core/v1"
+	k8serror "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/openebs/dynamic-localpv-provisioner/pkg/kubernetes/api/core/v1/container"
 	"github.com/openebs/dynamic-localpv-provisioner/pkg/kubernetes/api/core/v1/pod"
 	"github.com/openebs/dynamic-localpv-provisioner/pkg/kubernetes/api/core/v1/volume"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type podConfig struct {
@@ -68,6 +72,18 @@ type HelperPodOptions struct {
 	//path is the volume hostpath directory
 	path string
 
+	//capacity is the capacity requested in PVC
+	//capacity string
+
+	// scType
+	scType string
+
+	// bsoft
+	bsoft string
+
+	// bhard
+	bhard string
+
 	// serviceAccountName is the service account with which the pod should be launched
 	serviceAccountName string
 
@@ -95,11 +111,29 @@ func (pOpts *HelperPodOptions) validate() error {
 //  The local pv expect the hostpath to be already present before mounting
 //  into pod. Validate that the local pv host path is not created under root.
 func (p *Provisioner) createInitPod(pOpts *HelperPodOptions) error {
+	config, err := createPodConfig(pOpts, "init")
+	if err != nil {
+		return err
+	}
+
+	iPod, err := p.launchPod(config)
+	if err != nil {
+		return err
+	}
+
+	if err := p.exitPod(iPod); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func createPodConfig(pOpts *HelperPodOptions, podName string) (podConfig, error) {
 	var config podConfig
-	config.pOpts, config.podName = pOpts, "init"
+	config.pOpts, config.podName = pOpts, podName
 	//err := pOpts.validate()
 	if err := pOpts.validate(); err != nil {
-		return err
+		return config, err
 	}
 
 	// Initialize HostPath builder and validate that
@@ -110,18 +144,40 @@ func (p *Provisioner) createInitPod(pOpts *HelperPodOptions) error {
 		WithCheckf(hostpath.IsNonRoot(), "volume directory {%v} should not be under root directory", pOpts.path).
 		ExtractSubPath()
 	if vErr != nil {
-		return vErr
+		return config, vErr
 	}
 
 	//Pass on the taints, to create tolerations.
 	config.taints = pOpts.selectedNodeTaints
 
-	iPod, err := p.launchPod(config)
+	return config, nil
+}
+
+// createInitPod launches a helper(busybox) pod, to create the host path.
+//  The local pv expect the hostpath to be already present before mounting
+//  into pod. Validate that the local pv host path is not created under root.
+func (p *Provisioner) createXfsQuotaComponents(pOpts *HelperPodOptions) error {
+	config, err := createPodConfig(pOpts, "xfsquota")
 	if err != nil {
 		return err
 	}
 
-	if err := p.exitPod(iPod); err != nil {
+	xfsConfigMap, err := p.createXfsQuotaConfigMap()
+	if err != nil {
+		return err
+	}
+
+	/*xfsPod*/
+	_, err = p.launchXfsQuotaPod(config, xfsConfigMap)
+	if err != nil {
+		return err
+	}
+
+	/*if err := p.exitPod(xfsPod); err != nil {
+		return err
+	}*/
+
+	if err := p.DeleteConfigmap(xfsConfigMap); err != nil {
 		return err
 	}
 
@@ -162,6 +218,135 @@ func (p *Provisioner) createCleanupPod(pOpts *HelperPodOptions) error {
 		return err
 	}
 	return nil
+}
+
+func (p *Provisioner) launchXfsQuotaPod(config podConfig, xfsConfigMap *corev1.ConfigMap) (*corev1.Pod, error) {
+	// the helper pod need to be launched in privileged mode. This is because in CoreOS
+	// nodes, pods without privileged access cannot write to the host directory.
+	// Helper pods need to create and delete directories on the host.
+	privileged := true
+	runAsUser := int64(0)
+
+	helperPod, err := pod.NewBuilder().
+		WithName(config.podName+"-"+config.pOpts.name).
+		WithRestartPolicy(corev1.RestartPolicyNever).
+		WithSecurityContext(&runAsUser).
+		//WithNodeSelectorHostnameNew(config.pOpts.nodeHostname).
+		WithNodeAffinityNew(config.pOpts.nodeAffinityLabelKey, config.pOpts.nodeAffinityLabelValue).
+		WithServiceAccountName(config.pOpts.serviceAccountName).
+		WithTolerationsForTaints(config.taints...).
+		WithContainerBuilder(
+			container.NewBuilder().
+				WithName("local-path-" + config.podName).
+				WithImage(p.helperImage).
+				WithEnvsNew(setXfSPodEnvironmentVariables(config)).
+				WithCommandNew([]string{"/scripts/xfs-quota.sh"}).
+				WithVolumeMountsNew([]corev1.VolumeMount{
+					{
+						Name:      "data",
+						ReadOnly:  false,
+						MountPath: "/data/",
+					},
+					{
+						Name:      "xfs-quota",
+						ReadOnly:  false,
+						MountPath: "/scripts",
+					},
+				}).
+				WithPrivilegedSecurityContext(&privileged),
+		).
+		WithImagePullSecrets(config.pOpts.imagePullSecrets).
+		WithVolumeBuilder(
+			volume.NewBuilder().
+				WithName("data").
+				WithHostDirectory(config.parentDir),
+		).
+		WithVolumeBuilder(
+			volume.NewBuilder().
+				WithConfigMap(xfsConfigMap, 0755),
+		).
+		Build()
+
+	if err != nil {
+		return nil, err
+	}
+
+	var hPod *corev1.Pod
+
+	//Launch the helper pod.
+	hPod, err = p.kubeClient.CoreV1().Pods(p.namespace).Create(helperPod)
+	return hPod, err
+}
+
+func (p *Provisioner) createXfsQuotaConfigMap() (*corev1.ConfigMap, error) {
+	configMapData := make(map[string]string, 0)
+	fileContent, err := readFile("xfs-quota.sh")
+	if err != nil {
+		return nil, err
+	}
+
+	configMapData["xfs-quota.sh"] = fileContent
+	configMap := corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "xfs-quota",
+			Namespace: p.namespace,
+		},
+		Data: configMapData,
+	}
+
+	var hConfig *corev1.ConfigMap
+	hConfig, err = p.kubeClient.CoreV1().ConfigMaps(p.namespace).Create(&configMap)
+	if err != nil {
+		if !k8serror.IsAlreadyExists(err) {
+			return nil, err
+		}
+	}
+	return hConfig, nil
+}
+
+func readFile(filepath string) (string, error) {
+	b, err := ioutil.ReadFile(filepath) // just pass the file name
+	if err != nil {
+		return "", err
+	}
+
+	return string(b), nil
+}
+
+func setXfSPodEnvironmentVariables(config podConfig) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{
+			Name:  "SUB_DIR_NAME",
+			Value: config.volumeDir,
+		},
+		{
+			Name:  "BSOFT_LIMIT",
+			Value: getResourceLimit(config, Bsoft),
+		},
+		{
+			Name:  "BHARD_LIMIT",
+			Value: getResourceLimit(config, Bhard),
+		},
+	}
+	return env
+}
+
+func getResourceLimit(config podConfig, key string) string {
+	var limit string
+	if key == Bsoft {
+		limit = config.pOpts.bsoft
+	} else if key == Bhard {
+		limit = config.pOpts.bhard
+	}
+
+	if strings.HasSuffix(limit, "i") {
+		return limit[0 : len(limit)-1]
+	}
+	return limit
 }
 
 func (p *Provisioner) launchPod(config podConfig) (*corev1.Pod, error) {
@@ -232,6 +417,14 @@ func (p *Provisioner) exitPod(hPod *corev1.Pod) error {
 	}
 	if !completed {
 		return errors.Errorf("create process timeout after %v seconds", CmdTimeoutCounts)
+	}
+	return nil
+}
+
+func (p *Provisioner) DeleteConfigmap(hConfig *corev1.ConfigMap) error {
+	e := p.kubeClient.CoreV1().ConfigMaps(p.namespace).Delete(hConfig.Name, &metav1.DeleteOptions{})
+	if e != nil {
+		klog.Errorf("unable to delete the helper configmap: %v", e)
 	}
 	return nil
 }
